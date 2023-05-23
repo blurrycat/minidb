@@ -1,100 +1,54 @@
 use std::{
     cell::RefCell,
     fs::{File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Seek, Write},
+    io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
-use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 use crate::db::Collection;
 
 const MAIN_WAL_FILENAME: &str = "main.wal";
 
+#[derive(thiserror::Error, Debug)]
+pub enum LogError {
+    #[error("i/o error: {0}")]
+    Io(#[from] io::Error),
+    #[error("de/serialization error: {0}")]
+    Encoding(#[from] bincode::Error),
+
+    #[error("path '{0}' is not valid unicode")]
+    InvalidPath(PathBuf),
+    #[error("path '{0}' is not a directory")]
+    NotADirectory(PathBuf),
+}
+
+pub type LogResult<T> = Result<T, LogError>;
+
 /// An owned version for a LogOperation for deserializing purposes.
-#[derive(Debug, Decode)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 enum OwnedLogOperation {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
 }
 
-impl OwnedLogOperation {
-    fn to_log_operation(&self) -> LogOperation {
-        match self {
-            OwnedLogOperation::Put(key, value) => LogOperation::Put(key, value),
-            OwnedLogOperation::Delete(key) => LogOperation::Delete(key),
-        }
-    }
-}
-
 /// Represents an operation to be applied to the log.
-#[derive(Debug, Encode)]
+#[derive(Debug, Serialize)]
 pub enum LogOperation<'a> {
     Put(&'a [u8], &'a [u8]),
     Delete(&'a [u8]),
 }
 
-impl LogOperation<'_> {
-    /// Serializes the operation into a vector of bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
+#[allow(dead_code)]
+impl<'a> LogOperation<'a> {
+    fn to_owned(&self) -> OwnedLogOperation {
         match self {
-            LogOperation::Put(k, v) => {
-                let mut bytes = Vec::with_capacity(1 + 8 + k.len() + 8 + v.len());
-                let key_len: [u8; 8] = (k.len() as u64).to_be_bytes();
-                let value_len: [u8; 8] = (v.len() as u64).to_be_bytes();
-
-                bytes.push(b'p');
-                bytes.extend_from_slice(&key_len);
-                bytes.extend_from_slice(k);
-                bytes.extend_from_slice(&value_len);
-                bytes.extend_from_slice(v);
-
-                bytes
-            }
-            LogOperation::Delete(k) => {
-                let mut bytes = Vec::with_capacity(1 + 8 + k.len());
-                let key_len: [u8; 8] = (k.len() as u64).to_be_bytes();
-
-                bytes.push(b'd');
-                bytes.extend_from_slice(&key_len);
-                bytes.extend_from_slice(k);
-
-                bytes
-            }
+            LogOperation::Put(key, value) => OwnedLogOperation::Put(key.to_vec(), value.to_vec()),
+            LogOperation::Delete(key) => OwnedLogOperation::Delete(key.to_vec()),
         }
     }
 }
-
-// #[derive(Debug)]
-// pub struct LogBuilder {
-//     max_log_size: Option<u64>,
-// }
-
-// impl LogBuilder {
-//     /// Create a new builder for a Log
-//     pub fn new() -> Self {
-//         LogBuilder { max_log_size: None }
-//     }
-
-//     /// Sets the maximum size a WAL file can reach
-//     pub fn max_log_size(mut self, size: u64) -> Self {
-//         self.max_log_size = Some(size);
-//         self
-//     }
-
-//     /// Consume the builder to open a Log instance
-//     pub fn open(self, path: impl AsRef<Path>) -> io::Result<Log> {
-//         let max_log_size = self.max_log_size.unwrap_or(DEFAULT_MAX_LOG_SIZE);
-
-//         Log::open(path, max_log_size)
-//     }
-// }
-
-// impl Default for LogBuilder {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
 
 /// A simple Write-Ahead Log persisted to disk in a directory.
 ///
@@ -113,20 +67,14 @@ impl Log {
     /// Open a directory in which the WAL will be kept.
     ///
     /// This will create or open a `main.wal` file inside that directory.
-    pub fn open(path: impl AsRef<Path>, max_log_size: Option<u64>) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>, max_log_size: Option<u64>) -> LogResult<Self> {
         // Ensure path is valid unicode (so that we can safely unwrap it down the line)
         if path.as_ref().to_str().is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("'{}' is not valid unicode", path.as_ref().display()),
-            ));
+            return Err(LogError::InvalidPath(path.as_ref().into()));
         }
         // Ensure path is a directory
         if !path.as_ref().is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("'{}' is not a directory", path.as_ref().display()),
-            ));
+            return Err(LogError::NotADirectory(path.as_ref().into()));
         }
 
         let file = OpenOptions::new()
@@ -146,7 +94,7 @@ impl Log {
         Ok(log)
     }
 
-    fn list_snapshots(&self) -> io::Result<Vec<PathBuf>> {
+    fn list_snapshots(&self) -> LogResult<Vec<PathBuf>> {
         // This is safe because we have already checked in `open()` that the path
         // is valid unicode.
         let pattern = self.path.join("snapshot_*.wal");
@@ -159,7 +107,7 @@ impl Log {
         Ok(snapshots)
     }
 
-    fn update_snapshot_count(&self) -> io::Result<()> {
+    fn update_snapshot_count(&self) -> LogResult<()> {
         let snapshots = self.list_snapshots()?;
 
         // TODO: actually check that this fits in a u8
@@ -172,7 +120,7 @@ impl Log {
     ///
     /// This method may rotate the current WAL file if it is bigger than the
     /// optional limit.
-    pub fn append(&mut self, op: LogOperation) -> io::Result<()> {
+    pub fn append(&mut self, op: LogOperation) -> LogResult<()> {
         // If the current main log file is bigger than the limit we set, rotate it
         if let Some(max_log_size) = self.max_log_size {
             if self.main_log_size()? >= max_log_size {
@@ -181,14 +129,16 @@ impl Log {
         }
         write_operation(op, &mut self.current_file)?;
         // Ensure data is flushed to disk before returning from the operation
-        self.current_file.sync_data()
+        self.current_file.sync_data()?;
+
+        Ok(())
     }
 
     /// Return `true` if the WAL is empty.
     ///
     /// This checks for any snapshots present in the log directory, and will check
     /// all their sizes.
-    pub fn is_empty(&self) -> io::Result<bool> {
+    pub fn is_empty(&self) -> LogResult<bool> {
         let mut total_size = 0;
 
         let snapshots = self.list_snapshots()?;
@@ -201,12 +151,12 @@ impl Log {
         Ok(total_size == 0)
     }
 
-    fn main_log_size(&self) -> io::Result<u64> {
+    fn main_log_size(&self) -> LogResult<u64> {
         Ok(self.current_file.metadata()?.len())
     }
 
     /// Replay the WAL into the specified `collection`.
-    pub fn replay(&mut self, collection: &mut Collection) -> io::Result<()> {
+    pub fn replay(&mut self, collection: &mut Collection) -> LogResult<()> {
         let snapshots = self.list_snapshots()?;
         for snapshot in snapshots.into_iter() {
             replay_file(snapshot, collection)?;
@@ -218,7 +168,7 @@ impl Log {
     }
 
     /// Rotate the log file by renaming it and creating a new one in its place.
-    pub fn rotate(&mut self) -> io::Result<()> {
+    pub fn rotate(&mut self) -> LogResult<()> {
         let current_snapshot = self.current_snapshot.borrow().to_owned();
         let main_path = self.path.join(MAIN_WAL_FILENAME);
         let new_path = self
@@ -247,7 +197,7 @@ impl Log {
     ///
     /// Note this compaction process will never touch the main log file, you
     /// should rotate it beforehand if you care about pruning all deleted data.
-    pub fn compact(&self) -> io::Result<()> {
+    pub fn compact(&self) -> LogResult<()> {
         let snapshots = self.list_snapshots()?;
 
         let mut collection = Collection::new();
@@ -286,75 +236,34 @@ impl Log {
     }
 }
 
-fn write_operation<W>(op: LogOperation, writer: &mut W) -> io::Result<()>
+fn write_operation<W>(op: LogOperation, writer: &mut W) -> LogResult<()>
 where
     W: Write + Seek,
 {
-    let bytes = op.to_bytes();
     writer.seek(io::SeekFrom::End(0))?;
-    writer.write_all(&bytes)
+
+    bincode::serialize_into(writer, &op)?;
+    Ok(())
 }
 
 /// Replay a single log file into the specified collection.
-fn replay_file(path: impl AsRef<Path>, collection: &mut Collection) -> io::Result<()> {
+fn replay_file(path: impl AsRef<Path>, collection: &mut Collection) -> LogResult<()> {
     let file = OpenOptions::new().read(true).open(path)?;
     let mut bufreader = BufReader::new(file.try_clone()?);
 
     loop {
-        let mut op_type: [u8; 1] = [0; 1];
-        if let Err(e) = bufreader.read_exact(&mut op_type) {
-            match e.kind() {
-                // No operations left to read, we have finished replaying
-                // the log file.
-                io::ErrorKind::UnexpectedEof => break,
-                // If we get another error, it's probably safe to assume
-                // something went wrong here.
-                _ => return Err(e),
-            }
-        }
-
-        if op_type[0] == b'p' {
-            // Put
-            let mut key_len: [u8; 8] = [0; 8];
-            let mut value_len: [u8; 8] = [0; 8];
-
-            bufreader.read_exact(&mut key_len)?;
-            let key_len = u64::from_be_bytes(key_len);
-
-            let mut key = vec![0u8; key_len as usize];
-            bufreader.read_exact(&mut key)?;
-
-            bufreader.read_exact(&mut value_len)?;
-            let value_len = u64::from_be_bytes(value_len);
-
-            let mut value = vec![0u8; value_len as usize];
-            bufreader.read_exact(&mut value)?;
-
-            collection.insert(key, value);
-        } else if op_type[0] == b'd' {
-            // Delete
-            let mut key_len: [u8; 8] = [0; 8];
-
-            bufreader.read_exact(&mut key_len)?;
-            let key_len = u64::from_be_bytes(key_len);
-
-            let mut key = vec![0u8; key_len as usize];
-            bufreader.read_exact(&mut key)?;
-
-            collection.remove(&key);
-        } else {
-            eprintln!(
-                "Unrecognized operation type '{}', stopping log replay",
-                op_type[0] as char
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Unrecognized operation type '{}', stopping log replay",
-                    op_type[0] as char
-                ),
-            ));
-        }
+        let op: OwnedLogOperation = match bincode::deserialize_from(bufreader.by_ref()) {
+            Ok(op) => op,
+            Err(e) => match *e {
+                // We have reached the end of the Log file, stop the replay
+                bincode::ErrorKind::Io(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                _ => return Err(e.into()),
+            },
+        };
+        match op {
+            OwnedLogOperation::Put(key, value) => collection.insert(key, value),
+            OwnedLogOperation::Delete(key) => collection.remove(&key),
+        };
     }
 
     Ok(())
@@ -362,27 +271,35 @@ fn replay_file(path: impl AsRef<Path>, collection: &mut Collection) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     #[test]
     fn test_log_op_put() {
         let op = LogOperation::Put(b"key", b"value");
+        let serialized_op = bincode::serialize(&op).unwrap();
         assert_eq!(
-            op.to_bytes(),
+            serialized_op,
             [
-                b'p', 0, 0, 0, 0, 0, 0, 0, 3, b'k', b'e', b'y', 0, 0, 0, 0, 0, 0, 0, 5, b'v', b'a',
-                b'l', b'u', b'e',
+                0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 107, 101, 121, 5, 0, 0, 0, 0, 0, 0, 0, 118, 97,
+                108, 117, 101
             ]
         );
+        let deserialized_op: OwnedLogOperation = bincode::deserialize(&serialized_op).unwrap();
+        assert_eq!(deserialized_op, op.to_owned());
     }
 
     #[test]
     fn test_log_op_delete() {
         let op = LogOperation::Delete(b"key");
+        let serialized_op = bincode::serialize(&op).unwrap();
         assert_eq!(
-            op.to_bytes(),
-            [b'd', 0, 0, 0, 0, 0, 0, 0, 3, b'k', b'e', b'y']
+            bincode::serialize(&op).unwrap(),
+            [1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 107, 101, 121]
         );
+        let deserialized_op: OwnedLogOperation = bincode::deserialize(&serialized_op).unwrap();
+        assert_eq!(deserialized_op, op.to_owned());
     }
 
     #[test]
@@ -391,7 +308,7 @@ mod tests {
         let mut log = Log::open(tempdir.path(), None).unwrap();
 
         let op = LogOperation::Put(b"key", b"value");
-        let op_bytes = op.to_bytes();
+        let op_bytes = bincode::serialize(&op).unwrap();
 
         log.append(op).unwrap();
 
@@ -406,16 +323,25 @@ mod tests {
     #[test]
     fn test_log_file_replay() {
         let mut collection = Collection::new();
-        replay_file("./tests/data/replay.log", &mut collection).unwrap();
+        replay_file("./tests/data/replay.wal", &mut collection).unwrap();
 
         assert_eq!(collection.get(&b"key".to_vec()), None);
         assert_eq!(collection.get(&b"key1".to_vec()), Some(&"value1".into()));
     }
 
+    // TODO: this test passes but is completely wrong now that we use serde/bincode
     #[test]
     fn test_log_file_replay_invalid_op() {
         let mut collection = Collection::new();
-        assert!(replay_file("./tests/data/invalid_op.log", &mut collection).is_err())
+        let replay_result = replay_file("./tests/data/invalid_op.wal", &mut collection);
+        let expected_error = LogError::Encoding(bincode::Error::new(bincode::ErrorKind::Custom(
+            "invalid value: integer `2`, expected variant index 0 <= i < 2".into(),
+        )));
+        assert!(replay_result.is_err());
+        assert_eq!(
+            replay_result.unwrap_err().to_string(),
+            expected_error.to_string()
+        )
     }
 
     #[test]
@@ -424,7 +350,7 @@ mod tests {
         let mut log = Log::open(tempdir.path(), None).unwrap();
 
         let op = LogOperation::Put(b"key", b"value");
-        let op_bytes = op.to_bytes();
+        let op_bytes = bincode::serialize(&op).unwrap();
         log.append(op).unwrap();
 
         log.rotate().unwrap();
@@ -466,7 +392,7 @@ mod tests {
         let mut log = Log::open(tempdir.path(), None).unwrap();
 
         let op = LogOperation::Put(b"key", b"value");
-        let op1_bytes = op.to_bytes();
+        let op1_bytes = bincode::serialize(&op).unwrap();
         log.append(op).unwrap();
 
         let op = LogOperation::Put(b"key_to_delete", b"value");
@@ -478,7 +404,7 @@ mod tests {
         log.append(op).unwrap();
 
         let op = LogOperation::Put(b"key2", b"value2");
-        let op2_bytes = op.to_bytes();
+        let op2_bytes = bincode::serialize(&op).unwrap();
         log.append(op).unwrap();
 
         log.rotate().unwrap();

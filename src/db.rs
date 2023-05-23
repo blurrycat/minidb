@@ -1,10 +1,17 @@
 use std::{
     collections::BTreeMap,
-    io,
     path::{Path, PathBuf},
 };
 
-use crate::log::{Log, LogOperation};
+use crate::log::{Log, LogError, LogOperation};
+
+#[derive(thiserror::Error, Debug)]
+pub enum DBError {
+    #[error("underlying WAL error: {0}")]
+    WAL(#[from] LogError),
+}
+
+pub type DbResult<T> = Result<T, DBError>;
 
 pub(crate) type Collection = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -15,6 +22,7 @@ pub(crate) type Collection = BTreeMap<Vec<u8>, Vec<u8>>;
 /// Data is persisted to disk using a simple WAL, which is replayed when opening
 /// the database directory.
 ///
+// TODO: rewrite this
 /// Compaction and snapshots are not yet available, so a database will grow
 /// without bounds even when deleting data.
 ///
@@ -30,7 +38,7 @@ pub struct Database {
 
 impl Database {
     /// Open a `Database` from the specified `directory`.
-    pub fn open(directory: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(directory: impl AsRef<Path>) -> DbResult<Self> {
         // TODO: actually use the max size parameter here
         let mut log = Log::open(&directory, None)?;
         let mut collection = Collection::new();
@@ -47,7 +55,7 @@ impl Database {
     /// Insert `value` at `key` in the database.
     ///
     /// This can fail if writing to the WAL fails.
-    pub fn put<K, V>(&mut self, key: K, value: V) -> io::Result<()>
+    pub fn put<K, V>(&mut self, key: K, value: V) -> DbResult<()>
     where
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
@@ -73,7 +81,7 @@ impl Database {
     /// Delete a key from the database.
     ///
     /// This can fail if writing to the WAL fails.
-    pub fn delete<K>(&mut self, key: K) -> io::Result<()>
+    pub fn delete<K>(&mut self, key: K) -> DbResult<()>
     where
         K: Into<Vec<u8>>,
     {
