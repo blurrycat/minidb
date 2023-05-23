@@ -3,13 +3,20 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
-
-use serde::{Deserialize, Serialize};
 
 use crate::db::Collection;
 
+pub use self::operation::LogOperation;
+use self::{buffer::OperationBuffer, operation::OwnedLogOperation};
+
+mod buffer;
+mod operation;
+
 const MAIN_WAL_FILENAME: &str = "main.wal";
+const DEFAULT_BUFFER_CAPACITY: usize = 15;
+const DEFAULT_BUFFER_FLUSH_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(thiserror::Error, Debug)]
 pub enum LogError {
@@ -26,30 +33,6 @@ pub enum LogError {
 
 pub type LogResult<T> = Result<T, LogError>;
 
-/// An owned version for a LogOperation for deserializing purposes.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-enum OwnedLogOperation {
-    Put(Vec<u8>, Vec<u8>),
-    Delete(Vec<u8>),
-}
-
-/// Represents an operation to be applied to the log.
-#[derive(Debug, Serialize)]
-pub enum LogOperation<'a> {
-    Put(&'a [u8], &'a [u8]),
-    Delete(&'a [u8]),
-}
-
-#[allow(dead_code)]
-impl<'a> LogOperation<'a> {
-    fn to_owned(&self) -> OwnedLogOperation {
-        match self {
-            LogOperation::Put(key, value) => OwnedLogOperation::Put(key.to_vec(), value.to_vec()),
-            LogOperation::Delete(key) => OwnedLogOperation::Delete(key.to_vec()),
-        }
-    }
-}
-
 /// A simple Write-Ahead Log persisted to disk in a directory.
 ///
 /// The WAL can be rotated so that older data can rest on-disk. Over time this
@@ -60,7 +43,19 @@ pub struct Log {
     path: PathBuf,
     current_snapshot: RefCell<u8>,
     current_file: File,
+    op_buffer: OperationBuffer,
     max_log_size: Option<u64>,
+}
+
+impl Drop for Log {
+    fn drop(&mut self) {
+        if let Err(e) = self.op_buffer.flush(&mut self.current_file) {
+            eprintln!("could not flush buffer while closing log: {e}");
+        }
+        if let Err(e) = self.current_file.sync_all() {
+            eprintln!("could not sync main file while closing log: {e}");
+        }
+    }
 }
 
 impl Log {
@@ -86,6 +81,7 @@ impl Log {
         let log = Log {
             current_file: file,
             current_snapshot: RefCell::new(0),
+            op_buffer: OperationBuffer::new(DEFAULT_BUFFER_CAPACITY, DEFAULT_BUFFER_FLUSH_DURATION),
             path: path.as_ref().into(),
             max_log_size,
         };
@@ -133,9 +129,8 @@ impl Log {
                 self.rotate()?;
             }
         }
-        write_operation(op, &mut self.current_file)?;
-        // Ensure data is flushed to disk before returning from the operation
-        self.current_file.sync_data()?;
+
+        self.op_buffer.push(op.into(), &mut self.current_file)?;
 
         Ok(())
     }
@@ -163,12 +158,19 @@ impl Log {
 
     /// Replay the WAL into the specified `collection`.
     pub fn replay(&mut self, collection: &mut Collection) -> LogResult<()> {
+        // We need to replay all snapshots
         let snapshots = self.list_snapshots()?;
         for snapshot in snapshots.into_iter() {
             replay_file(snapshot, collection)?;
         }
 
+        // Then the main file
         replay_file(self.path.join(MAIN_WAL_FILENAME), collection)?;
+
+        // And finally the in-memory buffer
+        for entry in self.op_buffer.iter() {
+            entry.operation.apply(collection);
+        }
 
         Ok(())
     }
@@ -271,10 +273,7 @@ fn replay_file(path: impl AsRef<Path>, collection: &mut Collection) -> LogResult
                 _ => return Err(e.into()),
             },
         };
-        match op {
-            OwnedLogOperation::Put(key, value) => collection.insert(key, value),
-            OwnedLogOperation::Delete(key) => collection.remove(&key),
-        };
+        op.apply(collection);
     }
 
     Ok(())
@@ -283,6 +282,8 @@ fn replay_file(path: impl AsRef<Path>, collection: &mut Collection) -> LogResult
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, io::Read, os::unix::prelude::OsStringExt};
+
+    use crate::log::operation::OwnedLogOperation;
 
     use super::*;
 
@@ -353,6 +354,7 @@ mod tests {
 
         log.append(op).unwrap();
 
+        log.op_buffer.flush(&mut log.current_file).unwrap();
         // Read the underlying file and compare its contents to the serialized operation
         let mut buf = vec![];
         log.current_file.seek(io::SeekFrom::Start(0)).unwrap();
@@ -394,6 +396,7 @@ mod tests {
         let op_bytes = bincode::serialize(&op).unwrap();
         log.append(op).unwrap();
 
+        log.op_buffer.flush(&mut log.current_file).unwrap();
         log.rotate().unwrap();
 
         let main_metadata = tempdir.path().join(MAIN_WAL_FILENAME).metadata().unwrap();
@@ -415,6 +418,7 @@ mod tests {
         let op = LogOperation::Put(b"key_to_delete", b"value");
         log.append(op).unwrap();
 
+        log.op_buffer.flush(&mut log.current_file).unwrap();
         log.rotate().unwrap();
 
         let op = LogOperation::Delete(b"key_to_delete");
@@ -439,6 +443,7 @@ mod tests {
         let op = LogOperation::Put(b"key_to_delete", b"value");
         log.append(op).unwrap();
 
+        log.op_buffer.flush(&mut log.current_file).unwrap();
         log.rotate().unwrap();
 
         let op = LogOperation::Delete(b"key_to_delete");
@@ -448,6 +453,7 @@ mod tests {
         let op2_bytes = bincode::serialize(&op).unwrap();
         log.append(op).unwrap();
 
+        log.op_buffer.flush(&mut log.current_file).unwrap();
         log.rotate().unwrap();
         log.compact().unwrap();
 
@@ -471,14 +477,11 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let mut log = Log::open(tempdir.path(), Some(1)).unwrap(); // Should rotate after every insert
 
-        let op = LogOperation::Put(b"key1", b"value");
-        log.append(op).unwrap();
-
-        let op = LogOperation::Put(b"key2", b"value");
-        log.append(op).unwrap();
-
-        let op = LogOperation::Put(b"key3", b"value");
-        log.append(op).unwrap();
+        // This should allow us to have two buffer flushes, and as such, two rotations
+        for _ in 0..35 {
+            let op = LogOperation::Put(b"key", b"value");
+            log.append(op).unwrap();
+        }
 
         assert!(!log.is_empty().unwrap());
         assert_eq!(*log.current_snapshot.borrow(), 2);

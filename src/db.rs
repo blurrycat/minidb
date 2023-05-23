@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use crate::log::{Log, LogError, LogOperation};
 
