@@ -30,8 +30,6 @@ pub(crate) type Collection = BTreeMap<Vec<u8>, Vec<u8>>;
 /// the larger the memory usage.
 #[derive(Debug)]
 pub struct Database {
-    // Not currently used, but once we get to have snapshots we'll need it
-    _directory: PathBuf,
     collection: Collection,
     log: Log,
 }
@@ -45,11 +43,7 @@ impl Database {
         if !log.is_empty()? {
             log.replay(&mut collection)?;
         }
-        Ok(Database {
-            _directory: directory.as_ref().into(),
-            collection,
-            log,
-        })
+        Ok(Database { collection, log })
     }
 
     /// Insert `value` at `key` in the database.
