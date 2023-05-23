@@ -145,14 +145,14 @@ impl Log {
     /// This checks for any snapshots present in the log directory, and will check
     /// all their sizes.
     pub fn is_empty(&self) -> LogResult<bool> {
-        let mut total_size = 0;
+        let mut total_size: u64 = 0;
 
         let snapshots = self.list_snapshots()?;
         for snapshot in snapshots {
-            total_size += snapshot.metadata()?.len();
+            total_size = total_size.saturating_add(snapshot.metadata()?.len());
         }
 
-        total_size += self.current_file.metadata()?.len();
+        total_size = total_size.saturating_add(self.current_file.metadata()?.len());
 
         Ok(total_size == 0)
     }
