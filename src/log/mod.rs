@@ -343,7 +343,6 @@ mod tests {
         assert_eq!(collection.get(&b"key1".to_vec()), Some(&"value1".into()));
     }
 
-    // TODO: this test passes but is completely wrong now that we use serde/bincode
     #[test]
     fn test_log_file_replay_invalid_op() {
         let mut collection = Collection::new();
