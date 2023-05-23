@@ -45,3 +45,35 @@ impl<'a> LogOperation<'a> {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_op_put() {
+        let op = LogOperation::Put(b"key", b"value");
+        let serialized_op = bincode::serialize(&op).unwrap();
+        assert_eq!(
+            serialized_op,
+            [
+                0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 107, 101, 121, 5, 0, 0, 0, 0, 0, 0, 0, 118, 97,
+                108, 117, 101
+            ]
+        );
+        let deserialized_op: OwnedLogOperation = bincode::deserialize(&serialized_op).unwrap();
+        assert_eq!(deserialized_op, op.to_owned());
+    }
+
+    #[test]
+    fn test_log_op_delete() {
+        let op = LogOperation::Delete(b"key");
+        let serialized_op = bincode::serialize(&op).unwrap();
+        assert_eq!(
+            bincode::serialize(&op).unwrap(),
+            [1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 107, 101, 121]
+        );
+        let deserialized_op: OwnedLogOperation = bincode::deserialize(&serialized_op).unwrap();
+        assert_eq!(deserialized_op, op.to_owned());
+    }
+}
