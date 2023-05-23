@@ -168,17 +168,22 @@ impl Log {
     }
 
     /// Rotate the log file by renaming it and creating a new one in its place.
+    ///
+    /// This may perform a compaction if we have reached the maximum number of
+    /// snapshots in the directory (255).
     pub fn rotate(&mut self) -> LogResult<()> {
-        let current_snapshot = self.current_snapshot.borrow().to_owned();
+        let current_snapshot = *self.current_snapshot.borrow();
         let main_path = self.path.join(MAIN_WAL_FILENAME);
         let new_path = self
             .path
             .join(format!("snapshot_{:0>3}.wal", current_snapshot));
         std::fs::rename(&main_path, new_path)?;
 
-        // TODO: do not allow this to overflow. This could be done by forcing a
-        // compaction of older snapshots if the value would overflow.
-        self.current_snapshot.replace(current_snapshot + 1);
+        if *self.current_snapshot.borrow() < u8::MAX {
+            self.current_snapshot.replace(current_snapshot + 1);
+        } else {
+            self.compact()?;
+        }
 
         let new_file = OpenOptions::new()
             .append(true)
