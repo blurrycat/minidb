@@ -5,7 +5,7 @@ use std::{
 
 use super::{write_operation, LogOperation, LogResult, OwnedLogOperation};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub operation: OwnedLogOperation,
     instant: Instant,
@@ -77,5 +77,77 @@ impl OperationBuffer {
         writer.flush()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_buffer_push() {
+        let mut dummy_file = tempfile::tempfile().unwrap();
+        let mut buffer = OperationBuffer::new(10, Duration::from_secs(30));
+
+        let op = LogOperation::Put(b"key", b"value");
+        let entry: Entry = op.into();
+
+        buffer.push(entry.clone(), &mut dummy_file).unwrap();
+
+        assert_eq!(buffer.entries.len(), 1);
+        assert_eq!(buffer.entries[0], entry);
+    }
+
+    #[test]
+    fn test_buffer_flush() {
+        let mut dummy_file = tempfile::tempfile().unwrap();
+        let mut buffer = OperationBuffer::new(10, Duration::from_secs(30));
+
+        let op = LogOperation::Put(b"key", b"value");
+
+        buffer.push(op.into(), &mut dummy_file).unwrap();
+        buffer.flush(&mut dummy_file).unwrap();
+
+        let metadata = dummy_file.metadata().unwrap();
+        assert_ne!(metadata.len(), 0);
+        assert_eq!(buffer.entries.len(), 0);
+    }
+
+    #[test]
+    fn test_buffer_auto_flush_capacity() {
+        let mut dummy_file = tempfile::tempfile().unwrap();
+        let mut buffer = OperationBuffer::new(3, Duration::from_secs(30));
+
+        let op = LogOperation::Put(b"key", b"value");
+        buffer.push(op.clone().into(), &mut dummy_file).unwrap();
+        buffer.push(op.clone().into(), &mut dummy_file).unwrap();
+        buffer.push(op.clone().into(), &mut dummy_file).unwrap();
+        // This one should force a flush
+        buffer.push(op.into(), &mut dummy_file).unwrap();
+
+        let metadata = dummy_file.metadata().unwrap();
+        assert_ne!(metadata.len(), 0);
+        // There still should be one item in the buffer (the last one we added)
+        assert_eq!(buffer.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_buffer_auto_flush_time() {
+        let mut dummy_file = tempfile::tempfile().unwrap();
+        let mut buffer = OperationBuffer::new(10, Duration::from_millis(250));
+
+        let op = LogOperation::Put(b"key", b"value");
+        buffer.push(op.clone().into(), &mut dummy_file).unwrap();
+
+        // Sleep longer than the max flush interval
+        std::thread::sleep(Duration::from_millis(300));
+
+        // This one should force a flush since it's been some time now
+        buffer.push(op.into(), &mut dummy_file).unwrap();
+
+        let metadata = dummy_file.metadata().unwrap();
+        assert_ne!(metadata.len(), 0);
+        // There still should be one item in the buffer (the last one we added)
+        assert_eq!(buffer.entries.len(), 1);
     }
 }

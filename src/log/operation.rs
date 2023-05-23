@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::Collection;
 
 /// An owned version for a LogOperation for deserializing purposes.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum OwnedLogOperation {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
@@ -23,7 +23,7 @@ impl OwnedLogOperation {
 }
 
 /// Represents an operation to be applied to the log.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub enum LogOperation<'a> {
     Put(&'a [u8], &'a [u8]),
     Delete(&'a [u8]),
