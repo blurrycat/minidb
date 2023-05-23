@@ -454,4 +454,27 @@ mod tests {
             (op1_bytes.len() + op2_bytes.len()) as u64
         );
     }
+
+    #[test]
+    fn test_log_auto_rotate() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(tempdir.path(), Some(1)).unwrap(); // Should rotate after every insert
+
+        let op = LogOperation::Put(b"key1", b"value");
+        log.append(op).unwrap();
+
+        let op = LogOperation::Put(b"key2", b"value");
+        log.append(op).unwrap();
+
+        let op = LogOperation::Put(b"key3", b"value");
+        log.append(op).unwrap();
+
+        assert!(!log.is_empty().unwrap());
+        assert_eq!(*log.current_snapshot.borrow(), 2);
+    }
+
+    // #[test]
+    // fn test_log_auto_compact() {
+    //     todo!("auto compact")
+    // }
 }
