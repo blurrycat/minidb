@@ -109,9 +109,15 @@ impl Log {
 
     fn update_snapshot_count(&self) -> LogResult<()> {
         let snapshots = self.list_snapshots()?;
+        let snapshots_len = snapshots.len();
 
-        // TODO: actually check that this fits in a u8
-        self.current_snapshot.replace(snapshots.len() as u8);
+        // If we have too many snapshots, we trigger a compaction
+        if snapshots_len > u8::MAX.into() {
+            self.compact()?;
+        } else {
+            // This is safe as we just ensured
+            self.current_snapshot.replace(snapshots_len as u8);
+        }
 
         Ok(())
     }
