@@ -271,7 +271,7 @@ fn replay_file(path: impl AsRef<Path>, collection: &mut Collection) -> LogResult
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::{ffi::OsString, io::Read, os::unix::prelude::OsStringExt};
 
     use super::*;
 
@@ -300,6 +300,36 @@ mod tests {
         );
         let deserialized_op: OwnedLogOperation = bincode::deserialize(&serialized_op).unwrap();
         assert_eq!(deserialized_op, op.to_owned());
+    }
+
+    #[test]
+    fn test_log_invalid_path() {
+        let path = vec![b'/', 0xC3];
+        let path = PathBuf::from(OsString::from_vec(path));
+        let open_result = Log::open(&path, None);
+
+        let expected_error = LogError::InvalidPath(path);
+
+        assert!(open_result.is_err());
+        assert_eq!(
+            open_result.unwrap_err().to_string(),
+            expected_error.to_string()
+        );
+    }
+
+    #[test]
+    fn test_log_not_a_directory() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let path = path.path();
+        let open_result = Log::open(path, None);
+
+        let expected_error = LogError::NotADirectory(path.into());
+
+        assert!(open_result.is_err());
+        assert_eq!(
+            open_result.unwrap_err().to_string(),
+            expected_error.to_string()
+        );
     }
 
     #[test]
